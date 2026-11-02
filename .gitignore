@@ -24,3 +24,8 @@ probe.out
 .DS_Store
 leprobe
 pair
+
+# python
+__pycache__/
+*.pyc
+.venv/
