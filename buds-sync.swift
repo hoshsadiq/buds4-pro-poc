@@ -62,6 +62,27 @@ let vendorFrames: [[UInt8]] = [
 let genericVersionFrame: [UInt8] =
     [0xFC, 0x0C, 0x00, 0x01, 0x43, 0x43, 0x04, 0x03, 0x04, 0x00, 0x00, 0x0B, 0x00, 0xA7, 0x79, 0xCC]
 
+/// Sends Samsung's two vendor frames: auto-switch metadata version 3, then the
+/// take-over request carrying the computer device class.
+func claim(_ device: IOBluetoothDevice) -> Bool {
+    if !device.isConnected() { _ = device.openConnection() }
+    var waited = 0
+    while !device.isConnected() && waited < 40 {
+        Thread.sleep(forTimeInterval: 0.1)
+        waited += 1
+    }
+    if vendor.channel?.isOpen() != true {
+        _ = open(device, named: vendorService, vendor)
+    }
+    guard vendor.channel?.isOpen() == true else { return false }
+    var sent = false
+    for frame in vendorFrames {
+        sent = write(vendor, frame) || sent
+        Thread.sleep(forTimeInterval: 0.3)
+    }
+    return sent
+}
+
 struct MultipointStatus {
     var support = 0
     var state = 0
@@ -98,6 +119,66 @@ func defaultOutputName() -> String {
         return ""
     }
     return (name?.takeRetainedValue() as String?) ?? ""
+}
+
+/// Every output device with its name, so the earbuds can be found and made the default.
+func outputDevices() -> [(id: AudioDeviceID, name: String)] {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var size = UInt32(0)
+    guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size) == noErr else {
+        return []
+    }
+    let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+    var ids = [AudioDeviceID](repeating: 0, count: count)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &ids) == noErr else {
+        return []
+    }
+
+    var found: [(AudioDeviceID, String)] = []
+    for id in ids {
+        var streams = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+        var streamSize = UInt32(0)
+        guard AudioObjectGetPropertyDataSize(id, &streams, 0, nil, &streamSize) == noErr, streamSize > 0 else {
+            continue
+        }
+        var nameAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var nameSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        var name: Unmanaged<CFString>?
+        guard AudioObjectGetPropertyData(id, &nameAddress, 0, nil, &nameSize, &name) == noErr else {
+            continue
+        }
+        found.append((id, (name?.takeRetainedValue() as String?) ?? ""))
+    }
+    return found
+}
+
+/// Makes an output device the system default, which is what a Samsung host does after it
+/// wins the earbuds. Without this the music keeps going to the speakers.
+@discardableResult
+func makeDefaultOutput(matching token: String) -> Bool {
+    guard let target = outputDevices().first(where: { $0.name.lowercased().contains(token) }) else {
+        return false
+    }
+    if defaultOutputName().lowercased().contains(token) {
+        return true
+    }
+    var device = target.id
+    let size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    let status = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, size, &device)
+    return status == noErr
 }
 
 func audioIsPlaying() -> Bool {
@@ -179,11 +260,34 @@ func open(_ device: IOBluetoothDevice, named name: String, _ channel: Channel) -
     return true
 }
 
-func write(_ channel: Channel, _ bytes: [UInt8]) -> Bool {
+private let writeQueue = DispatchQueue(label: "buds.write", qos: .userInitiated)
+
+/// Writes with a deadline. A dead link makes writeSync block instead of failing, which
+/// would stall the whole loop, so the write runs on another queue and is abandoned if
+/// it does not come back in time.
+@discardableResult
+func write(_ channel: Channel, _ bytes: [UInt8], timeout: TimeInterval = 2) -> Bool {
     guard let ch = channel.channel else { return false }
-    var payload = bytes
-    let count = payload.count
-    return payload.withUnsafeMutableBytes { ch.writeSync($0.baseAddress, length: UInt16(count)) } == kIOReturnSuccess
+    if !ch.isOpen() {
+        channel.channel = nil
+        return false
+    }
+    let done = DispatchSemaphore(value: 0)
+    var ok = false
+    writeQueue.async {
+        var payload = bytes
+        let count = payload.count
+        ok = payload.withUnsafeMutableBytes {
+            ch.writeSync($0.baseAddress, length: UInt16(count))
+        } == kIOReturnSuccess
+        done.signal()
+    }
+    if done.wait(timeout: .now() + timeout) == .timedOut {
+        channel.channel = nil
+        return false
+    }
+    if !ok { channel.channel = nil }
+    return ok
 }
 
 func parseStatus(_ frame: [UInt8]) -> MultipointStatus? {
@@ -201,11 +305,58 @@ guard let buds = IOBluetoothDevice(addressString: address) else {
     exit(1)
 }
 
-signal(SIGPIPE, SIG_IGN)
-signal(SIGTERM) { _ in
-    log("stopping, restoring generic mode")
-    exit(0)
+/// Mutes or unmutes the current output device. Samsung backs up the user's own mute
+/// state first, so unmuting never overrides a mute the user set deliberately.
+var userWasMuted: Bool?
+
+func outputIsMuted() -> Bool {
+    var device = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var getAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &getAddress, 0, nil, &size, &device) == noErr else {
+        return false
+    }
+    var muted = UInt32(0)
+    var muteSize = UInt32(MemoryLayout<UInt32>.size)
+    var muteAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyMute,
+        mScope: kAudioDevicePropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain)
+    guard AudioObjectGetPropertyData(device, &muteAddress, 0, nil, &muteSize, &muted) == noErr else {
+        return false
+    }
+    return muted != 0
 }
+
+func setOutputMuted(_ mute: Bool) {
+    if outputIsMuted() == mute { return }
+    if mute, userWasMuted == nil {
+        userWasMuted = outputIsMuted()
+    }
+    var device = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var getAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &getAddress, 0, nil, &size, &device) == noErr else {
+        return
+    }
+    var value: UInt32 = mute ? 1 : 0
+    var muteAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyMute,
+        mScope: kAudioDevicePropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain)
+    _ = AudioObjectSetPropertyData(device, &muteAddress, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value)
+}
+
+signal(SIGPIPE, SIG_IGN)
+var shouldStop = false
+signal(SIGTERM) { _ in shouldStop = true }
+signal(SIGINT) { _ in shouldStop = true }
 
 let gear = Channel()
 let vendor = Channel()
@@ -214,6 +365,7 @@ var lastLost = Date.distantPast
 var lastRequest = Date.distantPast
 var requestSent: Date?
 
+var openFailures = 0
 var wasPlaying = false
 var playingSince: Date?
 var wasForeground = false
@@ -237,13 +389,16 @@ func restoreGenericMode() {
 log("watching \(buds.name ?? address)")
 
 while true {
+    let audible = audioIsPlaying()
+
+    // Never pull the earbuds to this Mac unless this Mac is actually producing sound.
     if !buds.isConnected() {
-        _ = buds.openConnection()
-        Thread.sleep(forTimeInterval: 1)
-        if !buds.isConnected() {
-            Thread.sleep(forTimeInterval: 2)
-            continue
+        if audible && playingSince.map({ Date().timeIntervalSince($0) >= sustainWindow }) == true {
+            log("not connected while playing, asking for the earbuds")
+            _ = claim(buds)
         }
+        Thread.sleep(forTimeInterval: pollInterval)
+        continue
     }
 
     if gear.channel?.isOpen() != true {
@@ -251,13 +406,24 @@ while true {
             if let parsed = parseStatus(frame) { status = parsed }
         }
         if !open(buds, named: gearService, gear) {
+            openFailures += 1
+            if openFailures == 1 || openFailures % 15 == 0 {
+                log("cannot open the status channel (\(openFailures) attempts). If macOS denied Bluetooth access, allow this app in System Settings, Privacy and Security, Bluetooth.")
+            }
             Thread.sleep(forTimeInterval: 2)
             continue
         }
+        openFailures = 0
         log("status channel open")
     }
 
-    _ = write(gear, standardFrame(0x76))
+    if !write(gear, standardFrame(0x76)) {
+        log("status channel stalled, reopening")
+        gear.channel?.close()
+        gear.channel = nil
+        Thread.sleep(forTimeInterval: 1)
+        continue
+    }
     Thread.sleep(forTimeInterval: 0.6)
 
     let playing = audioIsPlaying()
@@ -272,6 +438,12 @@ while true {
         if requestSent != nil { log("we hold the earbuds") }
         requestSent = nil
         steppedAside = false
+        setOutputMuted(false)
+    } else if playing && buds.isConnected() && !status.otherDeviceOnCall { 
+        // We have the earbuds back but macOS is still sending audio elsewhere.
+        if makeDefaultOutput(matching: "buds") {
+            log("made the earbuds the default output")
+        }
     }
     // Samsung only arms the anti-fight clock when it had foreground before.
     if wasForeground && !owns && playing {
@@ -279,6 +451,8 @@ while true {
     }
 
     if sustainedSound(now: now) && !owns {
+        // Samsung mutes while it waits, so the wait is silent rather than doubled.
+        setOutputMuted(true)
         if status.otherDeviceOnCall {
             if !steppedAside {
                 steppedAside = true
@@ -287,14 +461,7 @@ while true {
         } else if requestSent == nil,
                   now.timeIntervalSince(lastLost) >= antiFightWindow,
                   now.timeIntervalSince(lastRequest) >= requestSpacing {
-            if vendor.channel?.isOpen() != true {
-                _ = open(buds, named: vendorService, vendor)
-            }
-            if vendor.channel?.isOpen() == true {
-                for frame in vendorFrames {
-                    _ = write(vendor, frame)
-                    Thread.sleep(forTimeInterval: 0.3)
-                }
+            if claim(buds) {
                 log("asked for the earbuds")
                 requestSent = now
                 lastRequest = now
@@ -310,5 +477,18 @@ while true {
 
     wasPlaying = playing
     wasForeground = owns
+
+    if shouldStop {
+        log("stopping, sending generic metadata so the earbuds leave auto-switch mode")
+        if buds.isConnected(), vendor.channel?.isOpen() != true {
+            _ = open(buds, named: vendorService, vendor)
+        }
+        if vendor.channel?.isOpen() == true {
+            _ = write(vendor, genericVersionFrame)
+        }
+        setOutputMuted(false)
+        exit(0)
+    }
+
     Thread.sleep(forTimeInterval: pollInterval)
 }

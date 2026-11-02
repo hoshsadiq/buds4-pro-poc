@@ -103,6 +103,13 @@ func send(_ channel: IOBluetoothRFCOMMChannel, _ frame: [UInt8]) -> Bool {
     } == kIOReturnSuccess
 }
 
+/// Which radio link this host declares. Samsung's Windows host sends 1 for ordinary
+/// Bluetooth and 2 for LE Audio, depending on what the machine supports.
+func declaredTransport() -> UInt8 {
+    let value = (ProcessInfo.processInfo.environment["BUDS_TRANSPORT"] ?? "bt").lowercased()
+    return value == "le" ? 2 : 1
+}
+
 /// The three frames Samsung's host sends, in order: announce, enable auto-switch,
 /// then ask for the earbuds.
 func claim(_ device: IOBluetoothDevice) -> Bool {
@@ -114,8 +121,9 @@ func claim(_ device: IOBluetoothDevice) -> Bool {
     let delegate = Delegate()
     var sent = false
     if let gear = gearChannel(device, delegate) {
-        sent = send(gear, settingInfoFrame(transport: 1))
-        log("setting info sent: \(sent)")
+        let transport = declaredTransport()
+        sent = send(gear, settingInfoFrame(transport: transport))
+        log("setting info sent: \(sent), transport \(transport == 2 ? "LE Audio" : "Bluetooth") ")
         Thread.sleep(forTimeInterval: 0.3)
         gear.close()
     }

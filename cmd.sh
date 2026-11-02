@@ -1,6 +1,5 @@
 #!/bin/bash
-# Sends Samsung's three handshake frames in order and prints the replies.
-# Each gear call takes: address, frame, and how long to listen for a reply.
+# Sends the handshake frames and the feature flags that matter, then prints replies.
 # Requires BUDS_ADDR to hold the earbuds Bluetooth address.
 
 cd "$(dirname "$0")" || exit 1
@@ -23,3 +22,11 @@ echo "--- 2. metadata version, message 0x43, value 3 (auto-switch) ---"
 #    1 meaning computer. This is the frame that actually moves audio.
 echo "--- 3. take-over request, message 0x71, device class 1 (computer) ---"
 ./gear "$BUDS_ADDR" "FC 05 10 01 71 01 79 1C CC" "$LISTEN_LONG"
+
+# 4. Feature flags this host claims, written to the vendor channel. 0x011C is
+#    FEATURE_LE_AUDIO and 0x010E is FEATURE_AUTO_SWITCH.
+echo "--- 4. feature LE audio, property 0x011C = 1 ---"
+./gear "$BUDS_ADDR" "FC 08 00 01 43 1C 01 01 01 AF FA CC" "$LISTEN_SHORT"
+
+echo "--- 5. feature auto switch, property 0x010E = 1 ---"
+./gear "$BUDS_ADDR" "FC 08 00 01 43 0E 01 01 01 60 0C CC" "$LISTEN_SHORT"
