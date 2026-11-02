@@ -1,0 +1,24 @@
+# local configuration, holds the earbuds Bluetooth address
+.env
+
+# build output
+buds-sync
+buds-auto
+budsctl
+buds-seamless
+gear
+smep-host
+smep-read
+*.app/
+
+# runtime artefacts, which contain device addresses and logs
+*.log
+*.out
+drops/
+sync.log
+auto.log
+run.out
+probe.out
+
+# macOS
+.DS_Store
